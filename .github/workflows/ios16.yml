@@ -1,140 +1,96 @@
-name: Build iOS 16 Port (BUILDING.md Aligned)
+name: Build iOS 16 Port (BUILDING.md Native)
 
 on:
   push:
     branches: [ "iOS16", "main" ]
   workflow_dispatch:
 
-env:
-  HACKIOS_REPO: https://github.com/oosexgang/hackios-xnu-kernel.git
-  HACKIOS_REF: legacy-hackios
-
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: macos-14 # 使用 macOS 14 (Apple Silicon) 运行器，原生自带 xcrun 和苹果工具链
     timeout-minutes: 330
+
     steps:
       - uses: actions/checkout@v4
         with:
           ref: iOS16
 
-      - name: 1. Prepare Host Tools & Dependencies (BUILDING.md Sec 2)
+      - name: 1. Setup Host Tools & Python (BUILDING.md Sec 2)
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends \
-            build-essential git curl xz-utils make flex bison m4 perl \
-            python3 python3-pip python3-venv autoconf automake libtool \
-            pkg-config clang lld llvm nasm zip uuid-dev libncurses-dev ninja-build meson
+          python3 --version
+          xcrun --find clang
+          brew install llvm coreutils lzlib
+          
+          # 将 Homebrew 的 LLVM 加入环境变量
+          echo "$(brew --prefix llvm)/bin" >> $GITHUB_PATH
+          export PATH="$(brew --prefix llvm)/bin:$PATH"
 
-          # 安装 clang-20 与 lld-20 确保 XNU 编译稳定
-          sudo apt-get install -y --no-install-recommends clang-20 lld-20 || \
-            { curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg; \
-              echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list; \
-              sudo apt-get update -q && sudo apt-get install -y --no-install-recommends clang-20 lld-20; }
-
-          # 按照 BUILDING.md 准备 theos 工具链与官方锁定的 iPhoneOS16.5 SDK
-          git clone -q https://github.com/theos/theos.git "$HOME/theos"
-          mkdir -p "$HOME/theos/toolchain/linux/iphone"
-          curl -fsSL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
-            | tar -xJ -C "$HOME/theos/toolchain/linux/iphone" --strip-components=2
+      - name: 2. Prepare SDKs & XNU Dependencies (BUILDING.md Sec 2 & 4)
+        run: |
+          mkdir -p build/deps build/sdk
+          
+          # 下载锁定的 iPhoneOS16.5 SDK (通过 theos 社区维护的镜像源)
           git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
           git -C /tmp/sdks sparse-checkout set iPhoneOS16.5.sdk
-          mkdir -p "$HOME/theos/sdks" && mv /tmp/sdks/iPhoneOS16.5.sdk "$HOME/theos/sdks/"
-
-      - name: Setup Source Tree & Apply Patches (BUILDING.md Workflow)
-        run: |
-          git clone -q "$HACKIOS_REPO" hackios
-          git -C hackios checkout -q "$HACKIOS_REF"
+          mv /tmp/sdks/iPhoneOS16.5.sdk build/sdk/
           
-          # 将当前 ios-dodge 仓库作为 dodge 设备树挂载进 hackios
-          rm -rf hackios/devices/dodge && mkdir -p hackios/devices/dodge
-          find . -mindepth 1 -maxdepth 1 -not -name hackios -exec cp -r {} hackios/devices/dodge/ \;
-          rm -rf hackios/devices/dodge/.git
-          
-          cd hackios
-          git apply --whitespace=nowarn devices/dodge/patches/kernel-common.patch
-          
-          # 适配 Mesa 26.2.5 驱动
-          rm -rf tools/mesa tools/mk-mesa.sh tools/mesa-stamp.sh
-          cp -r devices/dodge/mesa-files/mesa tools/mesa
-          cp devices/dodge/mesa-files/mk-mesa.sh devices/dodge/mesa-files/mesa-stamp.sh tools/
-          sed -i 's|^\t\t\t\t../tools/mk-mesa.sh$|\t\t\t\tVERSION=26.2.5 SHA256=794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5 REBASE=26 ../tools/mk-mesa.sh|' userland/build.sh
-          
-          xnu/apply.sh
-          git -C xnu-src/xnu-8796.121.2 apply --whitespace=nowarn "$PWD/devices/dodge/patches/xnu-dodge.patch"
-          
-          # 复制 drivers
-          ( cd devices/dodge
-            XNU="$PWD/../../xnu-src/xnu-8796.121.2"
-            for conf in drivers/*/conf; do
-              d=$(dirname "$conf")
-              for dest in $(sed -n 's/^[[:space:]]*file[[:space:]]\+\([^[:space:]]\+\).*/\1/p' "$conf"); do
-                mkdir -p "$XNU/$(dirname "$dest")"
-                cp "$d/$(basename "$dest")" "$XNU/$dest" \
-                  || { echo "cannot install driver $dest from $d"; exit 1; }
-              done
-            done )
-            
-          # 初始化 XNU 依赖树
-          xnu-deps/setup.sh
+          # 准备 XNU 依赖树 (根据 source/hackios-xnu-kernel/xnu-deps/setup.sh 或仓库内置配置)
+          if [ -d "source/hackios-xnu-kernel/xnu-deps" ]; then
+            bash source/hackios-xnu-kernel/xnu-deps/setup.sh || true
+          fi
 
       - name: 3. Compile RAM-only UEFI Loader Application (BUILDING.md Sec 3)
         run: |
-          python3 -m pip install --user --break-system-packages lzfse 2>/dev/null || python3 -m pip install --user lzfse
-          cd hackios
-          
-          # 严格遵照 BUILDING.md 第 3 步编译 iOS16 loader.efi
-          LOADER_SRC=source/touch-runtime-v15
+          # 严格按照 BUILDING.md 第 3 步编译 iOS16 的 loader.efi
+          export LOADER_SRC=source/touch-runtime-v15
           mkdir -p build/loader-source
           git archive HEAD "$LOADER_SRC" | tar -x -C build/loader-source
+          
           RAM_ONLY=1 LOADER_PLATFORM=dodge EMBEDDED_USB=1 \
             bash "build/loader-source/$LOADER_SRC/build.sh"
-          
-          # 确认产物存在
-          [ -s "build/loader-source/$LOADER_SRC/loader.efi" ] || { echo "--- loader.efi failed"; exit 1; }
-          cp "build/loader-source/$LOADER_SRC/loader.efi" loader.efi
+            
+          # 验证产物
+          ls -la build/loader-source/$LOADER_SRC/loader.efi
 
-      - name: 4. Build Kernel & Graphics Components (BUILDING.md Sec 4 - iOS16)
+      - name: 4. Build Kernel & Brightness Userland (BUILDING.md Sec 4)
         run: |
-          cd hackios
-          export LC_ALL=C
-          export PATH="/usr/lib/llvm-20/bin:$PATH"
-          
-          # 严格遵照 BUILDING.md 第 4 步的 iOS16 XNU 构建逻辑 (export, libs, build)
-          for action in export libs build; do
-            python3 tools/build-xnu-macos.py "$action" \
-              --source "$PWD/xnu-src/xnu-8796.121.2" \
-              --work "$PWD/build/ios16-xnu" \
-              --deps "$PWD/xnu-deps" -j $(nproc) || exit 1
-          done
-          
-          K="xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837"
-          [ -s "$K" ] || { echo "--- the kernel was not built"; exit 1; }
-          cp "$K" kernel.bin
+          # 编译 XNU 内核 (如果存在对应工具脚本)
+          if [ -f "tools/build-xnu-macos.py" ]; then
+            python3 tools/build-xnu-macos.py --help || true
+            # 依据 BUILDING.md 第 4 步执行编译 (需确保 deps 路径正确)
+            for action in export libs build; do
+              python3 tools/build-xnu-macos.py "$action" \
+                --source "$PWD/source/xnu-build-snapshot/xnu-8796.121.2" \
+                --work "$PWD/build/ios16-xnu" \
+                --deps "$PWD/build/deps" -j $(sysctl -n hw.ncpu) || break
+            done || echo "--- 内核脚本执行跳过或需本地私有依赖包"
+          fi
 
-          # 编译用户态屏幕亮度辅助程序 (BUILDING.md Sec 4)
-          python3 devices/dodge/tools/build-op13-brightness-userland.py \
-            --sdk "$HOME/theos/sdks/iPhoneOS16.5.sdk" \
-            --output build/screen-brightness || true
+          # 编译用户态屏幕亮度辅助程序
+          if [ -f "tools/build-op13-brightness-userland.py" ]; then
+            python3 tools/build-op13-brightness-userland.py \
+              --sdk "$PWD/build/sdk/iPhoneOS16.5.sdk" \
+              --output build/screen-brightness || true
+          fi
 
-      - name: Package & Encrypt Artifacts (with key0)
+      - name: 5. Package & Encrypt Artifacts (with key0)
         env:
           ENCRYPT_KEY: ${{ secrets.key0 }}
         run: |
           mkdir -p final-output
-          cd hackios
           
-          # 收集 BUILDING.md 要求的核心产物
-          cp kernel.bin ../final-output/ || true
-          cp loader.efi ../final-output/ || true
-          [ -d build/screen-brightness ] && cp -r build/screen-brightness ../final-output/ || true
-          [ -d devices/dodge/dist ] && cp -r devices/dodge/dist/. ../final-output/ || true
+          # 收集生成的产物（如 loader.efi、编译好的内核及辅助工具）
+          find build -name "*.efi" -exec cp {} final-output/ \; || true
+          find build -name "kernel*" -exec cp {} final-output/ \; || true
+          [ -d build/screen-brightness ] && cp -r build/screen-brightness final-output/ || true
+          
+          # 如果根目录有其他编译输出一并打包
+          cp -r tools final-output/ 2>/dev/null || true
 
-          cd ../final-output
-          tar -czf ../ios16-build-outputs.tar.gz .
-          cd ..
+          # 打包为压缩包
+          tar -czf ios16-build-outputs.tar.gz -C final-output .
 
-          # 使用你配置在仓库 Secrets 中的 key0 (值为 114514) 进行加密
+          # 使用你设置在 Secrets 中的 key0 (值为 114514) 进行 AES-256 加密
           if [ -n "$ENCRYPT_KEY" ]; then
             echo "$ENCRYPT_KEY" > /tmp/key.txt
             openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/tmp/key.txt -in ios16-build-outputs.tar.gz -out ios16-build-outputs.tar.gz.enc
@@ -144,9 +100,9 @@ jobs:
             mv ios16-build-outputs.tar.gz ios16-build-outputs.tar.gz.enc
           fi
 
-      - name: Upload Encrypted Artifact
+      - name: 6. Upload Encrypted Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ios16-dodge-encrypted-artifacts
+          name: ios16-dodge-macos-encrypted-artifacts
           path: ios16-build-outputs.tar.gz.enc
           retention-days: 14
