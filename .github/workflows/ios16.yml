@@ -1,105 +1,165 @@
-name: Build iOS 16 Port (macOS Native)
+name: Build iOS16 (macOS, with diagnostics)
 
 on:
   push:
-    branches: [ "iOS16", "main" ]
+    branches: [iOS16]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14   # 确保只用标准的 macos-14，不要加多余的架构后缀
-    timeout-minutes: 330
+    runs-on: macos-latest
+    timeout-minutes: 360
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout iOS16
+        uses: actions/checkout@v4
         with:
           ref: iOS16
+          fetch-depth: 0
 
-      - name: 1. Setup Host Tools & Python (BUILDING.md Sec 2)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Homebrew dependencies
+        run: |
+          brew update
+          brew install llvm cmake ninja unifdef dtc mtools p7zip
+          echo "$(brew --prefix llvm)/bin" >> $GITHUB_PATH
+
+      - name: Verify toolchain
         run: |
           python3 --version
           xcrun --find clang
-          brew install llvm coreutils lzlib
-          
-          # 将 Homebrew 的 LLVM 加入环境变量
-          echo "$(brew --prefix llvm)/bin" >> $GITHUB_PATH
-          export PATH="$(brew --prefix llvm)/bin:$PATH"
+          command -v lld-link || true
+          xcrun --sdk iphoneos --show-sdk-path || true
 
-      - name: 2. Prepare SDKs & XNU Dependencies (BUILDING.md Sec 2 & 4)
+      # ---------- 诊断：仓库结构速览（把日志复制给我） ----------
+      - name: Diagnostic — repo layout
         run: |
-          mkdir -p build/deps build/sdk
-          
-          # 下载锁定的 iPhoneOS16.5 SDK
-          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
-          git -C /tmp/sdks sparse-checkout set iPhoneOS16.5.sdk
-          mv /tmp/sdks/iPhoneOS16.5.sdk build/sdk/
-          
-          # 准备 XNU 依赖树
-          if [ -d "source/hackios-xnu-kernel/xnu-deps" ]; then
-            bash source/hackios-xnu-kernel/xnu-deps/setup.sh || true
+          echo "===== top-level ====="
+          ls -la
+          echo "===== tools/ ====="
+          ls -la tools/ 2>/dev/null || echo "tools/ missing"
+          echo "===== source/ ====="
+          ls -la source/ 2>/dev/null || echo "source/ missing"
+          echo "===== xnu-deps/ ====="
+          ls -la xnu-deps/ 2>/dev/null || echo "xnu-deps/ missing"
+          echo "===== source/hackios-xnu-kernel/xnu-deps/ ====="
+          ls -la source/hackios-xnu-kernel/xnu-deps/ 2>/dev/null || echo "not found"
+          echo "===== build-xnu-macos.py help ====="
+          python3 tools/build-xnu-macos.py --help 2>&1 || true
+          echo "===== build-xnu-macos.py existence ====="
+          test -f tools/build-xnu-macos.py && echo "FOUND tools/build-xnu-macos.py" || echo "MISSING tools/build-xnu-macos.py"
+          test -f source/hackios-xnu-kernel/xnu-deps/setup.sh && echo "FOUND xnu-deps/setup.sh" || echo "MISSING xnu-deps/setup.sh"
+
+      # ---------- UEFI Loader（按 BUILDING.md 第 3 节） ----------
+      - name: Build UEFI Loader (RAM-only)
+        run: |
+          LOADER_SRC="source/touch-runtime-v15"
+          if [ ! -d "$LOADER_SRC" ]; then
+            echo "!!! $LOADER_SRC 不存在，请检查分支或路径" >&2
+            ls -la source/ 2>/dev/null || true
+            exit 1
           fi
-
-      - name: 3. Compile RAM-only UEFI Loader Application (BUILDING.md Sec 3)
-        run: |
-          # 严格按照 BUILDING.md 第 3 步编译 iOS16 的 loader.efi
-          export LOADER_SRC=source/touch-runtime-v15
           mkdir -p build/loader-source
           git archive HEAD "$LOADER_SRC" | tar -x -C build/loader-source
-          
           RAM_ONLY=1 LOADER_PLATFORM=dodge EMBEDDED_USB=1 \
             bash "build/loader-source/$LOADER_SRC/build.sh"
-            
-          # 验证产物
-          ls -la build/loader-source/$LOADER_SRC/loader.efi
+          echo "===== loader.efi ====="
+          ls -la "build/loader-source/$LOADER_SRC/loader.efi" 2>/dev/null || { echo "loader.efi NOT FOUND"; exit 1; }
 
-      - name: 4. Build Kernel & Brightness Userland (BUILDING.md Sec 4)
+      # ---------- 内核依赖准备（BUILDING.md 第 4 节提到 setup.sh） ----------
+      - name: XNU dependencies (setup.sh if present)
         run: |
-          # 编译 XNU 内核
-          if [ -f "tools/build-xnu-macos.py" ]; then
-            python3 tools/build-xnu-macos.py --help || true
-            for action in export libs build; do
-              python3 tools/build-xnu-macos.py "$action" \
-                --source "$PWD/source/xnu-build-snapshot/xnu-8796.121.2" \
-                --work "$PWD/build/ios16-xnu" \
-                --deps "$PWD/build/deps" -j $(sysctl -n hw.ncpu) || break
-            done || echo "--- 内核脚本执行跳过或需本地私有依赖包"
-          fi
-
-          # 编译用户态屏幕亮度辅助程序
-          if [ -f "tools/build-op13-brightness-userland.py" ]; then
-            python3 tools/build-op13-brightness-userland.py \
-              --sdk "$PWD/build/sdk/iPhoneOS16.5.sdk" \
-              --output build/screen-brightness || true
-          fi
-
-      - name: 5. Package & Encrypt Artifacts (with key0)
-        env:
-          ENCRYPT_KEY: ${{ secrets.key0 }}
-        run: |
-          mkdir -p final-output
-          
-          # 收集生成的产物
-          find build -name "*.efi" -exec cp {} final-output/ \; || true
-          find build -name "kernel*" -exec cp {} final-output/ \; || true
-          [ -d build/screen-brightness ] && cp -r build/screen-brightness final-output/ || true
-          cp -r tools final-output/ 2>/dev/null || true
-
-          # 打包为压缩包
-          tar -czf ios16-build-outputs.tar.gz -C final-output .
-
-          # 使用机密 key0 (114514) 进行加密
-          if [ -n "$ENCRYPT_KEY" ]; then
-            echo "$ENCRYPT_KEY" > /tmp/key.txt
-            openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/tmp/key.txt -in ios16-build-outputs.tar.gz -out ios16-build-outputs.tar.gz.enc
-            echo "--- 加密完成：ios16-build-outputs.tar.gz.enc"
+          # 尝试两个可能的位置
+          if [ -f "source/hackios-xnu-kernel/xnu-deps/setup.sh" ]; then
+            echo "Using source/hackios-xnu-kernel/xnu-deps/setup.sh"
+            bash source/hackios-xnu-kernel/xnu-deps/setup.sh
+          elif [ -f "xnu-deps/setup.sh" ]; then
+            echo "Using xnu-deps/setup.sh"
+            bash xnu-deps/setup.sh
           else
-            echo "--- 警告: 未检测到 key0 机密，产物未加密"
-            mv ios16-build-outputs.tar.gz ios16-build-outputs.tar.gz.enc
+            echo "!!! 未找到 setup.sh，依赖可能不完整。后续内核构建可能失败。"
+            echo "请把 Diagnostic — repo layout 的日志发给我，我来修正路径。"
           fi
 
-      - name: 6. Upload Encrypted Artifact
+      # ---------- 内核构建（BUILDING.md 第 4 节 export / libs / build） ----------
+      - name: Build Kernel (XNU)
+        run: |
+          echo "===== 内核源码候选位置 ====="
+          ls -d source/xnu-build-snapshot/* 2>/dev/null || true
+          ls -d source/hackios-xnu-kernel/xnu-* 2>/dev/null || true
+
+          # 自动探测可能的 XNU 源码目录
+          SOURCE_DIR=""
+          for d in source/xnu-build-snapshot/xnu-* source/hackios-xnu-kernel/xnu-* source/xnu-*; do
+            if [ -d "$d" ] && [ -f "$d/bsd/sys/param.h" ]; then
+              SOURCE_DIR="$PWD/$d"
+              break
+            fi
+          done
+          if [ -z "$SOURCE_DIR" ]; then
+            echo "!!! 找不到 XNU 源码目录（包含 bsd/sys/param.h 的目录）"
+            ls -la source/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "SOURCE_DIR = $SOURCE_DIR"
+
+          WORK_DIR="$PWD/build/ios16-xnu"
+          DEPS_DIR="$PWD/xnu-deps"
+          # 如果 xnu-deps 不存在，尝试用 source 下的
+          [ -d "$DEPS_DIR" ] || DEPS_DIR="$PWD/source/hackios-xnu-kernel/xnu-deps"
+          echo "DEPS_DIR = $DEPS_DIR"
+
+          for action in export libs build; do
+            echo "===== build-xnu-macos.py $action ====="
+            python3 tools/build-xnu-macos.py "$action" \
+              --source "$SOURCE_DIR" \
+              --work "$WORK_DIR" \
+              --deps "$DEPS_DIR" \
+              -j 4 || exit 1
+          done
+
+      # ---------- 亮度助手（可选） ----------
+      - name: Build Brightness Userland Helpers (optional)
+        continue-on-error: true
+        run: |
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "SDK_PATH = $SDK_PATH"
+          python3 tools/build-op13-brightness-userland.py \
+            --sdk "$SDK_PATH" \
+            --output build/screen-brightness || \
+            echo "亮度助手构建失败或跳过（不影响内核/loader 产物）"
+
+      # ---------- 组装产物（需要你后续确认路径） ----------
+      - name: Assemble artifacts (placeholder)
+        run: |
+          mkdir -p dist
+          # 把已确认的编译产物收进来
+          cp build/loader-source/source/touch-runtime-v15/loader.efi dist/ 2>/dev/null || true
+          # 内核产物路径取决于 build-xnu-macos.py 的输出，先留空，后续根据日志补
+          find build/ios16-xnu -name "mach.*" -o -name "kernel*" 2>/dev/null | head -20 || true
+          echo "--- 目前 dist 内容 ---"
+          ls -la dist/
+          echo "--- 请把此日志发给我，确认内核产物实际路径 ---"
+
+      # ---------- 加密打包（使用 key0） ----------
+      - name: Encrypt and package
+        if: always()
+        env:
+          PACKAGE_KEY: ${{ secrets.key0 }}
+        run: |
+          if [ -z "$PACKAGE_KEY" ]; then
+            echo "!!! secrets.key0 未设置，无法加密。请先在仓库设置机密 key0。"
+            exit 1
+          fi
+          7z a -t7z -mhe=on -p"$PACKAGE_KEY" ios16-build.7z ./dist
+          ls -la ios16-build.7z
+
+      - name: Upload encrypted artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ios16-dodge-macos-encrypted-artifacts
-          path: ios16-build-outputs.tar.gz.enc
-          retention-days: 14
+          name: ios16-encrypted-build
+          path: ios16-build.7z
