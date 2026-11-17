@@ -1,4 +1,4 @@
-name: Build iOS 16 Port (BUILDING.md Native)
+name: Build iOS 16 Port (macOS Native)
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14 # 使用 macOS 14 (Apple Silicon) 运行器，原生自带 xcrun 和苹果工具链
+    runs-on: macos-14   # 确保只用标准的 macos-14，不要加多余的架构后缀
     timeout-minutes: 330
 
     steps:
@@ -29,12 +29,12 @@ jobs:
         run: |
           mkdir -p build/deps build/sdk
           
-          # 下载锁定的 iPhoneOS16.5 SDK (通过 theos 社区维护的镜像源)
+          # 下载锁定的 iPhoneOS16.5 SDK
           git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
           git -C /tmp/sdks sparse-checkout set iPhoneOS16.5.sdk
           mv /tmp/sdks/iPhoneOS16.5.sdk build/sdk/
           
-          # 准备 XNU 依赖树 (根据 source/hackios-xnu-kernel/xnu-deps/setup.sh 或仓库内置配置)
+          # 准备 XNU 依赖树
           if [ -d "source/hackios-xnu-kernel/xnu-deps" ]; then
             bash source/hackios-xnu-kernel/xnu-deps/setup.sh || true
           fi
@@ -54,10 +54,9 @@ jobs:
 
       - name: 4. Build Kernel & Brightness Userland (BUILDING.md Sec 4)
         run: |
-          # 编译 XNU 内核 (如果存在对应工具脚本)
+          # 编译 XNU 内核
           if [ -f "tools/build-xnu-macos.py" ]; then
             python3 tools/build-xnu-macos.py --help || true
-            # 依据 BUILDING.md 第 4 步执行编译 (需确保 deps 路径正确)
             for action in export libs build; do
               python3 tools/build-xnu-macos.py "$action" \
                 --source "$PWD/source/xnu-build-snapshot/xnu-8796.121.2" \
@@ -79,18 +78,16 @@ jobs:
         run: |
           mkdir -p final-output
           
-          # 收集生成的产物（如 loader.efi、编译好的内核及辅助工具）
+          # 收集生成的产物
           find build -name "*.efi" -exec cp {} final-output/ \; || true
           find build -name "kernel*" -exec cp {} final-output/ \; || true
           [ -d build/screen-brightness ] && cp -r build/screen-brightness final-output/ || true
-          
-          # 如果根目录有其他编译输出一并打包
           cp -r tools final-output/ 2>/dev/null || true
 
           # 打包为压缩包
           tar -czf ios16-build-outputs.tar.gz -C final-output .
 
-          # 使用你设置在 Secrets 中的 key0 (值为 114514) 进行 AES-256 加密
+          # 使用机密 key0 (114514) 进行加密
           if [ -n "$ENCRYPT_KEY" ]; then
             echo "$ENCRYPT_KEY" > /tmp/key.txt
             openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/tmp/key.txt -in ios16-build-outputs.tar.gz -out ios16-build-outputs.tar.gz.enc
