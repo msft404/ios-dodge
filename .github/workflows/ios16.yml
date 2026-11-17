@@ -1,4 +1,4 @@
-name: Build iOS16 (macOS, with diagnostics)
+name: Build iOS16
 
 on:
   push:
@@ -7,7 +7,9 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # 按官方镜像列表选定 macos-15（Arm64，Xcode 16.x）。
+    # 不用 macos-latest（当前指向 macos-26，工具链太新且仍是 Beta）。
+    runs-on: macos-15
     timeout-minutes: 360
 
     steps:
@@ -26,16 +28,18 @@ jobs:
         run: |
           brew update
           brew install llvm cmake ninja unifdef dtc mtools p7zip
+          # BUILDING.md 明确要求让 Homebrew LLVM 可用（lld-link 来自这里）
           echo "$(brew --prefix llvm)/bin" >> $GITHUB_PATH
 
       - name: Verify toolchain
         run: |
           python3 --version
+          xcodebuild -version
           xcrun --find clang
           command -v lld-link || true
           xcrun --sdk iphoneos --show-sdk-path || true
 
-      # ---------- 诊断：仓库结构速览（把日志复制给我） ----------
+      # ---------- 诊断：把这段日志发我，就能一次性把所有路径写死 ----------
       - name: Diagnostic — repo layout
         run: |
           echo "===== top-level ====="
@@ -44,75 +48,69 @@ jobs:
           ls -la tools/ 2>/dev/null || echo "tools/ missing"
           echo "===== source/ ====="
           ls -la source/ 2>/dev/null || echo "source/ missing"
-          echo "===== xnu-deps/ ====="
-          ls -la xnu-deps/ 2>/dev/null || echo "xnu-deps/ missing"
-          echo "===== source/hackios-xnu-kernel/xnu-deps/ ====="
-          ls -la source/hackios-xnu-kernel/xnu-deps/ 2>/dev/null || echo "not found"
-          echo "===== build-xnu-macos.py help ====="
+          echo "===== build-xnu-macos.py --help ====="
           python3 tools/build-xnu-macos.py --help 2>&1 || true
-          echo "===== build-xnu-macos.py existence ====="
-          test -f tools/build-xnu-macos.py && echo "FOUND tools/build-xnu-macos.py" || echo "MISSING tools/build-xnu-macos.py"
-          test -f source/hackios-xnu-kernel/xnu-deps/setup.sh && echo "FOUND xnu-deps/setup.sh" || echo "MISSING xnu-deps/setup.sh"
+          echo "===== xnu-deps candidates ====="
+          for p in xnu-deps source/hackios-xnu-kernel/xnu-deps; do
+            if [ -d "$p" ]; then
+              echo "--- $p ---"
+              ls -la "$p"
+              [ -f "$p/setup.sh" ] && echo "  setup.sh: yes"
+            fi
+          done
+          echo "===== XNU source candidates ====="
+          ls -d source/xnu-* source/hackios-xnu-kernel/xnu-* 2>/dev/null || echo "no candidate"
+          echo "===== loader source ====="
+          ls -la source/touch-runtime-v15/ 2>/dev/null || echo "touch-runtime-v15 missing"
 
-      # ---------- UEFI Loader（按 BUILDING.md 第 3 节） ----------
+      # ---------- UEFI Loader（BUILDING.md 第 3 节） ----------
       - name: Build UEFI Loader (RAM-only)
         run: |
-          LOADER_SRC="source/touch-runtime-v15"
+          LOADER_SRC=source/touch-runtime-v15
           if [ ! -d "$LOADER_SRC" ]; then
-            echo "!!! $LOADER_SRC 不存在，请检查分支或路径" >&2
-            ls -la source/ 2>/dev/null || true
-            exit 1
+            echo "!!! $LOADER_SRC 不存在"; exit 1
           fi
           mkdir -p build/loader-source
           git archive HEAD "$LOADER_SRC" | tar -x -C build/loader-source
           RAM_ONLY=1 LOADER_PLATFORM=dodge EMBEDDED_USB=1 \
             bash "build/loader-source/$LOADER_SRC/build.sh"
-          echo "===== loader.efi ====="
-          ls -la "build/loader-source/$LOADER_SRC/loader.efi" 2>/dev/null || { echo "loader.efi NOT FOUND"; exit 1; }
+          test -f "build/loader-source/$LOADER_SRC/loader.efi" \
+            && echo "loader.efi OK" \
+            || { echo "loader.efi missing"; exit 1; }
 
-      # ---------- 内核依赖准备（BUILDING.md 第 4 节提到 setup.sh） ----------
-      - name: XNU dependencies (setup.sh if present)
+      # ---------- XNU deps（BUILDING.md 第 4 节提到的 setup.sh） ----------
+      - name: XNU dependencies (setup.sh)
         run: |
-          # 尝试两个可能的位置
           if [ -f "source/hackios-xnu-kernel/xnu-deps/setup.sh" ]; then
-            echo "Using source/hackios-xnu-kernel/xnu-deps/setup.sh"
+            echo "using source/hackios-xnu-kernel/xnu-deps/setup.sh"
             bash source/hackios-xnu-kernel/xnu-deps/setup.sh
           elif [ -f "xnu-deps/setup.sh" ]; then
-            echo "Using xnu-deps/setup.sh"
+            echo "using xnu-deps/setup.sh"
             bash xnu-deps/setup.sh
           else
-            echo "!!! 未找到 setup.sh，依赖可能不完整。后续内核构建可能失败。"
-            echo "请把 Diagnostic — repo layout 的日志发给我，我来修正路径。"
+            echo "!!! setup.sh 未找到，后续内核构建可能因缺依赖失败"
           fi
 
-      # ---------- 内核构建（BUILDING.md 第 4 节 export / libs / build） ----------
+      # ---------- 内核（BUILDING.md 第 4 节 export / libs / build） ----------
       - name: Build Kernel (XNU)
         run: |
-          echo "===== 内核源码候选位置 ====="
-          ls -d source/xnu-build-snapshot/* 2>/dev/null || true
-          ls -d source/hackios-xnu-kernel/xnu-* 2>/dev/null || true
-
-          # 自动探测可能的 XNU 源码目录
+          # 自动探测 XNU 源码目录（含 bsd/sys/param.h 的那个）
           SOURCE_DIR=""
           for d in source/xnu-build-snapshot/xnu-* source/hackios-xnu-kernel/xnu-* source/xnu-*; do
             if [ -d "$d" ] && [ -f "$d/bsd/sys/param.h" ]; then
-              SOURCE_DIR="$PWD/$d"
-              break
+              SOURCE_DIR="$PWD/$d"; break
             fi
           done
-          if [ -z "$SOURCE_DIR" ]; then
-            echo "!!! 找不到 XNU 源码目录（包含 bsd/sys/param.h 的目录）"
-            ls -la source/ 2>/dev/null || true
-            exit 1
-          fi
+          [ -z "$SOURCE_DIR" ] && { echo "!!! 找不到 XNU 源码目录"; ls -la source/ 2>/dev/null; exit 1; }
           echo "SOURCE_DIR = $SOURCE_DIR"
 
-          WORK_DIR="$PWD/build/ios16-xnu"
-          DEPS_DIR="$PWD/xnu-deps"
-          # 如果 xnu-deps 不存在，尝试用 source 下的
-          [ -d "$DEPS_DIR" ] || DEPS_DIR="$PWD/source/hackios-xnu-kernel/xnu-deps"
+          DEPS_DIR=""
+          for d in xnu-deps source/hackios-xnu-kernel/xnu-deps; do
+            if [ -d "$d" ]; then DEPS_DIR="$PWD/$d"; break; fi
+          done
           echo "DEPS_DIR = $DEPS_DIR"
 
+          WORK_DIR="$PWD/build/ios16-xnu"
           for action in export libs build; do
             echo "===== build-xnu-macos.py $action ====="
             python3 tools/build-xnu-macos.py "$action" \
@@ -122,38 +120,37 @@ jobs:
               -j 4 || exit 1
           done
 
-      # ---------- 亮度助手（可选） ----------
-      - name: Build Brightness Userland Helpers (optional)
+          echo "===== kernel artifacts in WORK_DIR ====="
+          find "$WORK_DIR" \( -name "mach.*" -o -name "kernel*" \) 2>/dev/null | head -30
+
+      # ---------- 亮度助手（BUILDING.md 第 4 节，可选） ----------
+      - name: Brightness userland helpers (optional)
         continue-on-error: true
         run: |
-          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
-          echo "SDK_PATH = $SDK_PATH"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "SDK = $SDK"
           python3 tools/build-op13-brightness-userland.py \
-            --sdk "$SDK_PATH" \
-            --output build/screen-brightness || \
-            echo "亮度助手构建失败或跳过（不影响内核/loader 产物）"
+            --sdk "$SDK" \
+            --output build/screen-brightness
 
-      # ---------- 组装产物（需要你后续确认路径） ----------
-      - name: Assemble artifacts (placeholder)
+      # ---------- 收集产物 ----------
+      - name: Collect artifacts
         run: |
           mkdir -p dist
-          # 把已确认的编译产物收进来
-          cp build/loader-source/source/touch-runtime-v15/loader.efi dist/ 2>/dev/null || true
-          # 内核产物路径取决于 build-xnu-macos.py 的输出，先留空，后续根据日志补
-          find build/ios16-xnu -name "mach.*" -o -name "kernel*" 2>/dev/null | head -20 || true
-          echo "--- 目前 dist 内容 ---"
+          cp "build/loader-source/source/touch-runtime-v15/loader.efi" dist/ 2>/dev/null || true
+          find build/ios16-xnu \( -name "mach.*" -o -name "kernel*" \) -exec cp {} dist/ \; 2>/dev/null || true
+          cp -r build/screen-brightness dist/ 2>/dev/null || true
+          echo "===== dist 内容 ====="
           ls -la dist/
-          echo "--- 请把此日志发给我，确认内核产物实际路径 ---"
 
-      # ---------- 加密打包（使用 key0） ----------
-      - name: Encrypt and package
+      # ---------- 加密打包（key0） ----------
+      - name: Encrypt package
         if: always()
         env:
           PACKAGE_KEY: ${{ secrets.key0 }}
         run: |
           if [ -z "$PACKAGE_KEY" ]; then
-            echo "!!! secrets.key0 未设置，无法加密。请先在仓库设置机密 key0。"
-            exit 1
+            echo "!!! secrets.key0 未设置"; exit 1
           fi
           7z a -t7z -mhe=on -p"$PACKAGE_KEY" ios16-build.7z ./dist
           ls -la ios16-build.7z
